@@ -50,9 +50,9 @@ Every existing `~/.config/zsh` is moved intact before replacement:
 ```
 
 Root receives the same backup under `/root/.config` when selected. The exact
-backup paths are printed at the end. Failed replacement validation restores the
-previous configuration; the failed files are retained with a `.failed-...`
-name for inspection.
+backup paths are printed at the end. Any later installation failure restores
+every replaced configuration and login shell. Failed replacement files are
+retained with a `.failed-...` name, and recovery actions are printed immediately.
 
 An existing `~/.zshenv` remains in place. The installer owns only the marked
 `zsh-bootstrap` block appended to it, replacing that block on later runs rather
@@ -67,7 +67,8 @@ than adding duplicates.
 - `/opt/zsh-bootstrap` — Neovim fallback files, when needed
 - `/etc/shells` — updated only if the installed Zsh path is absent
 
-The installer does not set a system-wide `ZDOTDIR`.
+The installer does not set a system-wide `ZDOTDIR`. It removes the exact
+legacy block written by older versions after a successful per-user setup.
 
 ## Verify
 
