@@ -37,11 +37,33 @@ OS_MAJOR=''
 PACKAGE_MANAGER=''
 TIMESTAMP="$(date +%Y%m%d-%H%M%S)"
 TRANSACTION_OPEN=false
+SUDO_KEEPALIVE_PID=''
 declare -a BACKUPS=() ROLLBACKS=()
 declare -a CONFIG_TARGETS=() CONFIG_HOMES=() CONFIG_BACKUPS=()
 declare -a SHELL_USERS=() SHELL_OLD_VALUES=()
 
+stop_sudo_keepalive() {
+  if [[ -n "$SUDO_KEEPALIVE_PID" ]]; then
+    kill "$SUDO_KEEPALIVE_PID" 2>/dev/null || true
+    wait "$SUDO_KEEPALIVE_PID" 2>/dev/null || true
+    SUDO_KEEPALIVE_PID=''
+  fi
+}
+
+start_sudo_keepalive() {
+  stop_sudo_keepalive
+  # Refresh the sudo timestamp while this installer runs (long package/network steps).
+  # kill -0 "$$" exits the loop when the parent shell is gone.
+  while true; do
+    sudo -n true || exit
+    sleep 30
+    kill -0 "$$" || exit
+  done 2>/dev/null &
+  SUDO_KEEPALIVE_PID=$!
+}
+
 cleanup() {
+  stop_sudo_keepalive
   [[ -n "$WORK_DIR" && -d "$WORK_DIR" ]] && rm -rf -- "$WORK_DIR"
   return 0
 }
@@ -68,6 +90,35 @@ run_as_target() {
   else
     "$@"
   fi
+}
+
+# Download a single pinned commit (shallow when the remote allows it).
+# Falls back to a full clone + checkout so older git remotes still work.
+clone_pinned_commit() {
+  local url=$1 dest=$2 commit=$3
+  [[ -n "$url" && -n "$dest" && -n "$commit" ]] ||
+    die "clone_pinned_commit requires url, destination, and commit"
+
+  rm -rf -- "$dest"
+  mkdir -p "$dest"
+  git -C "$dest" init -q
+  git -C "$dest" remote add origin "$url"
+
+  if git -C "$dest" fetch --depth 1 --quiet origin "$commit"; then
+    git -C "$dest" -c advice.detachedHead=false checkout -q --detach FETCH_HEAD ||
+      die "Could not check out pinned commit $commit from $url"
+  else
+    warn "Shallow fetch failed for $url; falling back to a full clone"
+    rm -rf -- "$dest"
+    git clone --quiet "$url" "$dest" || die "Could not clone $url"
+    git -C "$dest" -c advice.detachedHead=false checkout -q --detach "$commit" ||
+      die "Could not check out pinned commit $commit from $url"
+  fi
+
+  [[ $(git -C "$dest" rev-parse HEAD) == "$commit" ]] ||
+    die "Pinned commit mismatch for $url (expected $commit)"
+  # Named local branch at the pin (no fragile origin/master upstream tracking).
+  git -C "$dest" checkout -q -B bootstrap-pinned
 }
 
 preflight() {
@@ -99,11 +150,27 @@ preflight() {
   info "Detected: ${PRETTY_NAME:-$ID $VERSION_ID} / x86_64"
   info "Verifying sudo access..."
   sudo -v || die "The invoking user needs sudo access"
+  start_sudo_keepalive
 
-  if [[ -t 0 ]]; then
-    read -r -p "Configure root with the same Zsh environment? [y/N] " answer
-    [[ "$answer" =~ ^[Yy]$ ]] && INSTALL_ROOT=true
-  fi
+  # Noninteractive opt-in/out for automation. Unset → prompt on a TTY, else user only.
+  case "${ZSH_BOOTSTRAP_INSTALL_ROOT:-}" in
+    1|true|yes|YES|True)
+      INSTALL_ROOT=true
+      info "Root configuration enabled via ZSH_BOOTSTRAP_INSTALL_ROOT"
+      ;;
+    0|false|no|NO|False)
+      INSTALL_ROOT=false
+      ;;
+    '')
+      if [[ -t 0 ]]; then
+        read -r -p "Configure root with the same Zsh environment? [y/N] " answer
+        [[ "$answer" =~ ^[Yy]$ ]] && INSTALL_ROOT=true
+      fi
+      ;;
+    *)
+      die "Invalid ZSH_BOOTSTRAP_INSTALL_ROOT value: ${ZSH_BOOTSTRAP_INSTALL_ROOT} (use 1/true/yes or 0/false/no)"
+      ;;
+  esac
 }
 
 package_available() {
@@ -284,10 +351,7 @@ prepare_template() {
   step "Pinned Zsh configuration"
   CONFIG_TEMPLATE="$WORK_DIR/zsh-template"
   info "Downloading the pinned Zsh configuration..."
-  git clone "$CONFIG_REPO" "$CONFIG_TEMPLATE"
-  git -C "$CONFIG_TEMPLATE" checkout -q --detach "$CONFIG_COMMIT"
-  [[ $(git -C "$CONFIG_TEMPLATE" rev-parse HEAD) == "$CONFIG_COMMIT" ]] ||
-    die "Could not select the pinned Zsh configuration"
+  clone_pinned_commit "$CONFIG_REPO" "$CONFIG_TEMPLATE" "$CONFIG_COMMIT"
   # Keep non-interactive startup validation from failing when no TTY exists.
   sed -i 's#export GPG_TTY=$(tty)#export GPG_TTY=$(tty 2>/dev/null || true)#' \
     "$CONFIG_TEMPLATE/.zshenv"
@@ -302,9 +366,7 @@ prepare_template() {
   while IFS='|' read -r repo name commit; do
     plugin_dir="$CONFIG_TEMPLATE/plugins/$name"
     info "Downloading Zsh plugin: $name..."
-    git clone "https://github.com/$repo.git" "$plugin_dir"
-    git -C "$plugin_dir" checkout -q -b bootstrap-pinned "$commit"
-    git -C "$plugin_dir" branch -q --set-upstream-to=origin/master bootstrap-pinned
+    clone_pinned_commit "https://github.com/$repo.git" "$plugin_dir" "$commit"
   done <<'EOF'
 zsh-users/zsh-autosuggestions|zsh-autosuggestions|85919cd1ffa7d2d5412f6d3fe437ebdbeeec4fc5
 zsh-users/zsh-history-substring-search|zsh-history-substring-search|14c8d2e0ffaee98f2df9850b19944f32546fdea5
@@ -384,7 +446,9 @@ validate_config() {
     run_as_target "$target" zsh -n "$file" || return 1
   done <<< "$files"
 
+  # LANG/LC_ALL=C keeps "command not found:" matching stable across locales.
   startup_output=$(run_as_target "$target" env HOME="$home" PATH="$SYSTEM_PATH" \
+    LANG=C LC_ALL=C \
     XDG_CONFIG_HOME="$home/.config" XDG_CACHE_HOME="$home/.cache" \
     XDG_STATE_HOME="$home/.local/state" zsh -f -o ERR_EXIT -ic \
     'export ZDOTDIR=$1; source "$1/.zshenv"; source "$1/.zshrc"' zsh "$config_dir" 2>&1) ||
@@ -552,7 +616,9 @@ summary() {
 main() {
   printf '%bzsh-bootstrap%b\n' "$BOLD" "$NC"
   preflight
-  WORK_DIR=$(mktemp -d /tmp/zsh-bootstrap.XXXXXX)
+  # -t uses $TMPDIR when set, otherwise the system temp directory.
+  WORK_DIR=$(mktemp -d -t zsh-bootstrap.XXXXXX) ||
+    die "Could not create a temporary working directory"
   install_packages
   verify_tools
   prepare_template

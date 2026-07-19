@@ -21,7 +21,12 @@ bash zsh-bootstrap.sh
 During an interactive run, the installer asks whether root should receive the
 same environment. Choosing Yes also changes root's login shell after its Zsh
 configuration passes validation. Without a terminal, only the invoking user is
-configured.
+configured unless `ZSH_BOOTSTRAP_INSTALL_ROOT` is set (`1`/`true`/`yes` to
+include root, `0`/`false`/`no` to skip the prompt and leave root alone).
+
+Re-running the installer replaces each selected user's `~/.config/zsh` with a
+fresh pinned copy (previous tree moved to a timestamped backup). Required
+packages that are already present are left in place.
 
 ## What it does
 
