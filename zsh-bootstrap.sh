@@ -121,7 +121,10 @@ package_available() {
 
 install_package() {
   local command_name=$1 apt_package=$2 dnf_package=$3 alternate=${4:-} group=$5 package_name
-  system_has "$command_name" && return 0
+  if system_has "$command_name"; then
+    info "Found required command: $command_name"
+    return 0
+  fi
 
   if [[ "$PACKAGE_MANAGER" == apt ]]; then
     package_name=$apt_package
@@ -129,9 +132,12 @@ install_package() {
     package_name=$dnf_package
   fi
 
-  if [[ "$group" == tool ]] && ! package_available "$package_name"; then
-    install_fallback "$command_name"
-    return
+  if [[ "$group" == tool ]]; then
+    info "Checking repositories for $package_name..."
+    if ! package_available "$package_name"; then
+      install_fallback "$command_name"
+      return
+    fi
   fi
 
   info "Installing $package_name..."
@@ -193,7 +199,9 @@ install_fallback() {
   warn "$command_name is unavailable as a distro package; using the pinned official binary"
   sudo mkdir -p /usr/local/bin
   archive="$WORK_DIR/${command_name}.tar.gz"
+  info "Downloading $command_name..."
   curl --proto '=https' --tlsv1.2 -fL --retry 3 -o "$archive" "$url"
+  info "Verifying and installing $command_name..."
   printf '%s  %s\n' "$sha256" "$archive" | sha256sum -c - >/dev/null ||
     die "Checksum verification failed for $command_name"
 
@@ -240,14 +248,17 @@ setup_rhel_repositories() {
   sudo dnf install -y \
     "https://dl.fedoraproject.org/pub/epel/epel-release-latest-${OS_MAJOR}.noarch.rpm" ||
     warn "Could not enable EPEL; missing tools will use verified upstream binaries"
+
+  step "Repository metadata"
+  info "Refreshing metadata after repository changes..."
+  sudo dnf makecache -y || die "dnf could not refresh repository metadata"
 }
 
 install_packages() {
   step "Required tools"
   if [[ "$PACKAGE_MANAGER" == apt ]]; then
+    info "Refreshing APT package metadata..."
     sudo apt-get update -q
-  else
-    sudo dnf makecache -y
   fi
 
   local group command_name apt_package dnf_package alternate
@@ -270,18 +281,22 @@ install_packages() {
 prepare_template() {
   step "Pinned Zsh configuration"
   CONFIG_TEMPLATE="$WORK_DIR/zsh-template"
-  git clone -q "$CONFIG_REPO" "$CONFIG_TEMPLATE"
+  info "Downloading the pinned Zsh configuration..."
+  git clone "$CONFIG_REPO" "$CONFIG_TEMPLATE"
   git -C "$CONFIG_TEMPLATE" checkout -q --detach "$CONFIG_COMMIT"
   [[ $(git -C "$CONFIG_TEMPLATE" rev-parse HEAD) == "$CONFIG_COMMIT" ]] ||
     die "Could not select the pinned Zsh configuration"
   # Keep non-interactive startup validation from failing when no TTY exists.
-  sed -i 's|export GPG_TTY=$(tty)|export GPG_TTY=$(tty 2>/dev/null || true)|' \
+  sed -i 's#export GPG_TTY=$(tty)#export GPG_TTY=$(tty 2>/dev/null || true)#' \
     "$CONFIG_TEMPLATE/.zshenv"
+  grep -qxF 'export GPG_TTY=$(tty 2>/dev/null || true)' "$CONFIG_TEMPLATE/.zshenv" ||
+    die "Could not prepare the pinned Zsh configuration"
 
   local repo name commit plugin_dir
   while IFS='|' read -r repo name commit; do
     plugin_dir="$CONFIG_TEMPLATE/plugins/$name"
-    git clone -q "https://github.com/$repo.git" "$plugin_dir"
+    info "Downloading Zsh plugin: $name..."
+    git clone "https://github.com/$repo.git" "$plugin_dir"
     git -C "$plugin_dir" checkout -q -b bootstrap-pinned "$commit"
     git -C "$plugin_dir" branch -q --set-upstream-to=origin/master bootstrap-pinned
   done <<'EOF'
@@ -296,6 +311,7 @@ EOF
   write_personal_config
 
   ICONS_FILE="$WORK_DIR/lf-icons"
+  info "Downloading lf icons..."
   curl --proto '=https' --tlsv1.2 -fL --retry 3 -o "$ICONS_FILE" "$ICONS_URL"
   printf '%s  %s\n' "$ICONS_SHA256" "$ICONS_FILE" | sha256sum -c - >/dev/null ||
     die "Checksum verification failed for lf icons"
@@ -398,9 +414,11 @@ install_config_for() {
   run_as_target "$target" mkdir -p "$home/.config" "$home/.local/state/zsh" "$home/.cache/zsh"
   install_icons "$target" "$home"
 
+  info "Staging configuration for $target..."
   stage=$(run_as_target "$target" mktemp -d "$home/.config/.zsh-bootstrap.XXXXXX")
   run_as_target "$target" cp -a "$CONFIG_TEMPLATE/." "$stage/"
   [[ "$target" == root ]] && sudo chown -R root:root "$stage"
+  info "Validating staged configuration for $target..."
   if ! validate_config "$target" "$home" "$stage"; then
     failed="$home/.config/zsh.failed-$TIMESTAMP-$$"
     run_as_target "$target" mv "$stage" "$failed"
@@ -417,8 +435,10 @@ install_config_for() {
   CONFIG_HOMES+=("$home")
   CONFIG_BACKUPS+=("$backup")
 
+  info "Activating configuration for $target..."
   run_as_target "$target" mv "$stage" "$config" || die "Could not activate configuration for $target"
   update_zshenv "$target" "$home" || die "Could not update $home/.zshenv"
+  info "Validating installed configuration for $target..."
   validate_config "$target" "$home" "$config" || die "Configuration validation failed for $target"
   info "Installed: $config"
 }
@@ -468,6 +488,7 @@ set_login_shell() {
   old_shell=$(getent passwd "$user" | cut -d: -f7)
   [[ -n "$old_shell" ]] || die "Could not determine the login shell for $user"
   if [[ "$old_shell" != "$zsh_path" ]]; then
+    info "Changing the login shell for $user..."
     sudo chsh -s "$zsh_path" "$user" || die "Could not change the login shell for $user"
     SHELL_USERS+=("$user")
     SHELL_OLD_VALUES+=("$old_shell")
@@ -494,6 +515,7 @@ remove_legacy_global_zdotdir() {
 verify_tools() {
   local group command_name apt_package dnf_package alternate
   while IFS='|' read -r group command_name apt_package dnf_package alternate; do
+    info "Verifying required command: $command_name"
     system_has "$command_name" || die "Required command is missing after installation: $command_name"
     if [[ "$command_name" == lf ]]; then
       PATH="$SYSTEM_PATH" lf -version &>/dev/null || die "Required command cannot run: lf"
