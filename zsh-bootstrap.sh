@@ -17,6 +17,7 @@ readonly ICONS_SHA256='734a2b0d03b885e761fb168dae8bc2d207a1e62ab62be7be3d920be5a
 readonly TOOL_SPECS='core|zsh|zsh|zsh|
 core|git|git|git|
 core|curl|curl|curl|
+dependency|chsh|passwd|util-linux-user|
 tool|nvim|neovim|neovim|
 tool|eza|eza|eza|
 tool|bat|bat|bat|batcat
@@ -42,6 +43,7 @@ declare -a SHELL_USERS=() SHELL_OLD_VALUES=()
 
 cleanup() {
   [[ -n "$WORK_DIR" && -d "$WORK_DIR" ]] && rm -rf -- "$WORK_DIR"
+  return 0
 }
 
 on_exit() {
@@ -264,7 +266,7 @@ install_packages() {
   local group command_name apt_package dnf_package alternate
   # Install these first because the remaining setup depends on them.
   while IFS='|' read -r group command_name apt_package dnf_package alternate; do
-    [[ "$group" == core ]] || continue
+    [[ "$group" == core || "$group" == dependency ]] || continue
     install_package "$command_name" "$apt_package" "$dnf_package" "$alternate" "$group"
   done <<< "$TOOL_SPECS"
   if ! command -v tar &>/dev/null || ! command -v sha256sum &>/dev/null; then
@@ -291,6 +293,10 @@ prepare_template() {
     "$CONFIG_TEMPLATE/.zshenv"
   grep -qxF 'export GPG_TTY=$(tty 2>/dev/null || true)' "$CONFIG_TEMPLATE/.zshenv" ||
     die "Could not prepare the pinned Zsh configuration"
+  sed -i 's#export PATH="$HOME/.local/bin:$PATH"#export PATH="$HOME/.local/bin:/usr/local/bin:$PATH"#' \
+    "$CONFIG_TEMPLATE/.zshenv"
+  grep -qxF 'export PATH="$HOME/.local/bin:/usr/local/bin:$PATH"' \
+    "$CONFIG_TEMPLATE/.zshenv" || die "Could not prepare the Zsh command path"
 
   local repo name commit plugin_dir
   while IFS='|' read -r repo name commit; do
@@ -320,7 +326,6 @@ EOF
 write_personal_config() {
   cat > "$CONFIG_TEMPLATE/aliases.personal.zsh" <<'EOF'
 # Managed by zsh-bootstrap; the previous configuration is backed up on every run.
-export PATH="$HOME/.local/bin:/usr/local/bin:$PATH"
 command -v direnv &>/dev/null && eval "$(direnv hook zsh)"
 
 alias ..='cd ..'
@@ -371,7 +376,7 @@ install_icons() {
 }
 
 validate_config() {
-  local target=$1 home=$2 config_dir=$3 file files
+  local target=$1 home=$2 config_dir=$3 file files startup_output startup_status=0
   files=$(run_as_target "$target" find "$config_dir" -maxdepth 1 -type f \
     \( -name '*.zsh' -o -name '.zshrc' -o -name '.zshenv' \) -print) || return 1
   [[ -n "$files" ]] || return 1
@@ -379,10 +384,14 @@ validate_config() {
     run_as_target "$target" zsh -n "$file" || return 1
   done <<< "$files"
 
-  run_as_target "$target" env HOME="$home" \
+  startup_output=$(run_as_target "$target" env HOME="$home" PATH="$SYSTEM_PATH" \
     XDG_CONFIG_HOME="$home/.config" XDG_CACHE_HOME="$home/.cache" \
     XDG_STATE_HOME="$home/.local/state" zsh -f -o ERR_EXIT -ic \
-    'export ZDOTDIR=$1; source "$1/.zshenv"; source "$1/.zshrc"' zsh "$config_dir"
+    'export ZDOTDIR=$1; source "$1/.zshenv"; source "$1/.zshrc"' zsh "$config_dir" 2>&1) ||
+    startup_status=$?
+  [[ -z "$startup_output" ]] || printf '%s\n' "$startup_output" >&2
+  (( startup_status == 0 )) || return 1
+  [[ "$startup_output" != *'command not found:'* ]]
 }
 
 update_zshenv() {
@@ -515,6 +524,7 @@ remove_legacy_global_zdotdir() {
 verify_tools() {
   local group command_name apt_package dnf_package alternate
   while IFS='|' read -r group command_name apt_package dnf_package alternate; do
+    [[ "$group" == dependency ]] && continue
     info "Verifying required command: $command_name"
     system_has "$command_name" || die "Required command is missing after installation: $command_name"
     if [[ "$command_name" == lf ]]; then
