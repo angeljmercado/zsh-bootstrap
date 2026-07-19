@@ -14,6 +14,18 @@ readonly CONFIG_REPO='https://github.com/radleylewis/zsh.git'
 readonly CONFIG_COMMIT='2edf9f4c271ae1bee91e6e4e30db5ce580810d27'
 readonly ICONS_URL='https://raw.githubusercontent.com/gokcehan/lf/r41/etc/icons.example'
 readonly ICONS_SHA256='734a2b0d03b885e761fb168dae8bc2d207a1e62ab62be7be3d920be5a6f19c89'
+readonly TOOL_SPECS='core|zsh|zsh|zsh|
+core|git|git|git|
+core|curl|curl|curl|
+tool|nvim|neovim|neovim|
+tool|eza|eza|eza|
+tool|bat|bat|bat|batcat
+tool|fd|fd-find|fd-find|fdfind
+tool|fzf|fzf|fzf|
+tool|zoxide|zoxide|zoxide|
+tool|starship|starship|starship|
+tool|rg|ripgrep|ripgrep|
+tool|lf|lf|lf|'
 
 INSTALL_ROOT=false
 WORK_DIR=''
@@ -23,16 +35,30 @@ OS_ID=''
 OS_MAJOR=''
 PACKAGE_MANAGER=''
 TIMESTAMP="$(date +%Y%m%d-%H%M%S)"
+TRANSACTION_OPEN=false
 declare -a BACKUPS=() ROLLBACKS=()
+declare -a CONFIG_TARGETS=() CONFIG_HOMES=() CONFIG_BACKUPS=()
+declare -a SHELL_USERS=() SHELL_OLD_VALUES=()
 
 cleanup() {
   [[ -n "$WORK_DIR" && -d "$WORK_DIR" ]] && rm -rf -- "$WORK_DIR"
 }
-trap cleanup EXIT
+
+on_exit() {
+  local status=$?
+  trap - EXIT
+  if (( status != 0 )) && $TRANSACTION_OPEN; then
+    set +e
+    rollback_transaction
+  fi
+  cleanup
+  exit "$status"
+}
+trap on_exit EXIT
 
 system_has() { PATH="$SYSTEM_PATH" command -v "$1" &>/dev/null; }
 
-run_for() {
+run_as_target() {
   local target=$1
   shift
   if [[ "$target" == root ]]; then
@@ -78,22 +104,48 @@ preflight() {
   fi
 }
 
+package_available() {
+  local package_name=$1 result
+  if [[ "$PACKAGE_MANAGER" == apt ]]; then
+    result=$(LC_ALL=C apt-cache policy "$package_name") ||
+      die "apt could not query package availability: $package_name"
+    [[ -z "$result" ]] && return 1
+    [[ "$result" == *'Candidate: (none)'* ]] && return 1
+    [[ "$result" == *'Candidate:'* ]] || die "apt returned an invalid result for: $package_name"
+  else
+    result=$(dnf -q repoquery --available --qf '%{name}' "$package_name") ||
+      die "dnf could not query package availability: $package_name"
+    [[ -n "$result" ]] || return 1
+  fi
+}
+
 install_package() {
-  local command_name=$1 package_name=$2 alternate=${3:-}
+  local command_name=$1 apt_package=$2 dnf_package=$3 alternate=${4:-} group=$5 package_name
   system_has "$command_name" && return 0
+
+  if [[ "$PACKAGE_MANAGER" == apt ]]; then
+    package_name=$apt_package
+  else
+    package_name=$dnf_package
+  fi
+
+  if [[ "$group" == tool ]] && ! package_available "$package_name"; then
+    install_fallback "$command_name"
+    return
+  fi
 
   info "Installing $package_name..."
   if [[ "$PACKAGE_MANAGER" == apt ]]; then
-    sudo apt-get install -y "$package_name" || true
+    sudo apt-get install -y "$package_name" || die "apt failed to install required package: $package_name"
   else
-    sudo dnf install -y "$package_name" || true
+    sudo dnf install -y "$package_name" || die "dnf failed to install required package: $package_name"
   fi
 
   if [[ -n "$alternate" ]] && system_has "$alternate" && ! system_has "$command_name"; then
+    sudo mkdir -p /usr/local/bin
     sudo ln -sfn "$(PATH="$SYSTEM_PATH" command -v "$alternate")" "/usr/local/bin/$command_name"
   fi
-  system_has "$command_name" && return 0
-  install_fallback "$command_name"
+  system_has "$command_name" || die "$package_name installed but did not provide required command: $command_name"
 }
 
 install_fallback() {
@@ -139,6 +191,7 @@ install_fallback() {
   esac
 
   warn "$command_name is unavailable as a distro package; using the pinned official binary"
+  sudo mkdir -p /usr/local/bin
   archive="$WORK_DIR/${command_name}.tar.gz"
   curl --proto '=https' --tlsv1.2 -fL --retry 3 -o "$archive" "$url"
   printf '%s  %s\n' "$sha256" "$archive" | sha256sum -c - >/dev/null ||
@@ -197,24 +250,21 @@ install_packages() {
     sudo dnf makecache -y
   fi
 
+  local group command_name apt_package dnf_package alternate
   # Install these first because the remaining setup depends on them.
-  install_package zsh zsh
-  install_package git git
-  install_package curl curl
+  while IFS='|' read -r group command_name apt_package dnf_package alternate; do
+    [[ "$group" == core ]] || continue
+    install_package "$command_name" "$apt_package" "$dnf_package" "$alternate" "$group"
+  done <<< "$TOOL_SPECS"
   if ! command -v tar &>/dev/null || ! command -v sha256sum &>/dev/null; then
     die "tar and sha256sum are required"
   fi
 
   setup_rhel_repositories
-  install_package nvim neovim
-  install_package eza eza
-  install_package bat bat batcat
-  install_package fd fd-find fdfind
-  install_package fzf fzf
-  install_package zoxide zoxide
-  install_package starship starship
-  install_package rg ripgrep
-  install_package lf lf
+  while IFS='|' read -r group command_name apt_package dnf_package alternate; do
+    [[ "$group" == tool ]] || continue
+    install_package "$command_name" "$apt_package" "$dnf_package" "$alternate" "$group"
+  done <<< "$TOOL_SPECS"
 }
 
 prepare_template() {
@@ -224,6 +274,9 @@ prepare_template() {
   git -C "$CONFIG_TEMPLATE" checkout -q --detach "$CONFIG_COMMIT"
   [[ $(git -C "$CONFIG_TEMPLATE" rev-parse HEAD) == "$CONFIG_COMMIT" ]] ||
     die "Could not select the pinned Zsh configuration"
+  # Keep non-interactive startup validation from failing when no TTY exists.
+  sed -i 's|export GPG_TTY=$(tty)|export GPG_TTY=$(tty 2>/dev/null || true)|' \
+    "$CONFIG_TEMPLATE/.zshenv"
 
   local repo name commit plugin_dir
   while IFS='|' read -r repo name commit; do
@@ -278,7 +331,12 @@ alias path='echo $PATH | tr ":" "\n"'
 
 # Fedora/RHEL packages use a different FZF integration path than upstream.
 if (( ! ${+widgets[fzf-history-widget]} )); then
-  source <(fzf --zsh)
+  if ! _fzf_init=$(fzf --zsh); then
+    print -u2 "fzf does not provide Zsh integration"
+    return 1
+  fi
+  eval "$_fzf_init"
+  unset _fzf_init
 fi
 EOF
 
@@ -290,76 +348,114 @@ EOF
 install_icons() {
   local target=$1 home=$2 icons
   icons="$home/.config/lf/icons"
-  run_for "$target" mkdir -p "$home/.config/lf"
-  if ! run_for "$target" test -f "$icons"; then
-    run_for "$target" install -m 0644 "$ICONS_FILE" "$icons"
+  run_as_target "$target" mkdir -p "$home/.config/lf"
+  if ! run_as_target "$target" test -f "$icons"; then
+    run_as_target "$target" install -m 0644 "$ICONS_FILE" "$icons"
   fi
 }
 
 validate_config() {
-  local target=$1 home=$2 config_dir=$3 file
-  while IFS= read -r -d '' file; do
-    run_for "$target" zsh -n "$file"
-  done < <(find "$config_dir" -maxdepth 1 -type f \( -name '*.zsh' -o -name '.zshrc' -o -name '.zshenv' \) -print0)
+  local target=$1 home=$2 config_dir=$3 file files
+  files=$(run_as_target "$target" find "$config_dir" -maxdepth 1 -type f \
+    \( -name '*.zsh' -o -name '.zshrc' -o -name '.zshenv' \) -print) || return 1
+  [[ -n "$files" ]] || return 1
+  while IFS= read -r file; do
+    run_as_target "$target" zsh -n "$file" || return 1
+  done <<< "$files"
 
-  run_for "$target" env HOME="$home" ZDOTDIR="$config_dir" \
+  run_as_target "$target" env HOME="$home" \
     XDG_CONFIG_HOME="$home/.config" XDG_CACHE_HOME="$home/.cache" \
-    XDG_STATE_HOME="$home/.local/state" zsh -lic 'exit'
+    XDG_STATE_HOME="$home/.local/state" zsh -f -o ERR_EXIT -ic \
+    'export ZDOTDIR=$1; source "$1/.zshenv"; source "$1/.zshrc"' zsh "$config_dir"
 }
 
 update_zshenv() {
   local target=$1 home=$2 file
   file="$home/.zshenv"
-  run_for "$target" touch "$file"
-  run_for "$target" sed -i --follow-symlinks \
-    '/^# >>> zsh-bootstrap >>>$/,/^# <<< zsh-bootstrap <<<$/{d;}' "$file"
+  run_as_target "$target" touch "$file" || return 1
+  run_as_target "$target" sed -i --follow-symlinks \
+    '/^# >>> zsh-bootstrap >>>$/,/^# <<< zsh-bootstrap <<<$/{d;}' "$file" || return 1
 
   if [[ "$target" == root ]]; then
-    printf '%s\n' '' \
-      '# >>> zsh-bootstrap >>>' \
-      'export ZDOTDIR="${XDG_CONFIG_HOME:-$HOME/.config}/zsh"' \
-      '[[ -r "$ZDOTDIR/.zshenv" ]] && source "$ZDOTDIR/.zshenv"' \
-      '# <<< zsh-bootstrap <<<' | sudo tee -a "$file" >/dev/null
+    zdotdir_block | sudo tee -a "$file" >/dev/null
   else
-    printf '%s\n' '' \
-      '# >>> zsh-bootstrap >>>' \
-      'export ZDOTDIR="${XDG_CONFIG_HOME:-$HOME/.config}/zsh"' \
-      '[[ -r "$ZDOTDIR/.zshenv" ]] && source "$ZDOTDIR/.zshenv"' \
-      '# <<< zsh-bootstrap <<<' >> "$file"
+    zdotdir_block >> "$file"
   fi
+}
+
+zdotdir_block() {
+  printf '%s\n' '' \
+    '# >>> zsh-bootstrap >>>' \
+    'export ZDOTDIR="${XDG_CONFIG_HOME:-$HOME/.config}/zsh"' \
+    '[[ -r "$ZDOTDIR/.zshenv" ]] && source "$ZDOTDIR/.zshenv"' \
+    '# <<< zsh-bootstrap <<<'
 }
 
 install_config_for() {
   local target=$1 home=$2 config stage backup='' failed
   config="$home/.config/zsh"
   step "Zsh configuration: $target"
-  run_for "$target" mkdir -p "$home/.config" "$home/.local/state/zsh" "$home/.cache/zsh"
+  run_as_target "$target" mkdir -p "$home/.config" "$home/.local/state/zsh" "$home/.cache/zsh"
   install_icons "$target" "$home"
 
-  stage=$(run_for "$target" mktemp -d "$home/.config/.zsh-bootstrap.XXXXXX")
-  run_for "$target" cp -a "$CONFIG_TEMPLATE/." "$stage/"
+  stage=$(run_as_target "$target" mktemp -d "$home/.config/.zsh-bootstrap.XXXXXX")
+  run_as_target "$target" cp -a "$CONFIG_TEMPLATE/." "$stage/"
   [[ "$target" == root ]] && sudo chown -R root:root "$stage"
-  validate_config "$target" "$home" "$stage" || die "Staged configuration validation failed for $target"
+  if ! validate_config "$target" "$home" "$stage"; then
+    failed="$home/.config/zsh.failed-$TIMESTAMP-$$"
+    run_as_target "$target" mv "$stage" "$failed"
+    die "Staged configuration validation failed for $target; files saved at $failed"
+  fi
 
-  if run_for "$target" test -e "$config"; then
+  if run_as_target "$target" test -e "$config"; then
     backup="$home/.config/zsh.backup-$TIMESTAMP"
-    run_for "$target" test ! -e "$backup" || die "Backup already exists: $backup"
-    run_for "$target" mv "$config" "$backup"
+    run_as_target "$target" test ! -e "$backup" || die "Backup already exists: $backup"
+    run_as_target "$target" mv "$config" "$backup"
     BACKUPS+=("$target: $backup")
   fi
-  run_for "$target" mv "$stage" "$config"
-  update_zshenv "$target" "$home"
+  CONFIG_TARGETS+=("$target")
+  CONFIG_HOMES+=("$home")
+  CONFIG_BACKUPS+=("$backup")
 
-  if ! validate_config "$target" "$home" "$config"; then
-    failed="$home/.config/zsh.failed-$TIMESTAMP"
-    run_for "$target" mv "$config" "$failed"
-    if [[ -n "$backup" ]]; then
-      run_for "$target" mv "$backup" "$config"
-      die "Configuration validation failed for $target; previous configuration restored"
-    fi
-    die "Configuration validation failed for $target; failed files saved at $failed"
-  fi
+  run_as_target "$target" mv "$stage" "$config" || die "Could not activate configuration for $target"
+  update_zshenv "$target" "$home" || die "Could not update $home/.zshenv"
+  validate_config "$target" "$home" "$config" || die "Configuration validation failed for $target"
   info "Installed: $config"
+}
+
+rollback_transaction() {
+  local i user old_shell target home config backup failed
+  warn "Installation failed; rolling back completed changes"
+
+  for ((i=${#SHELL_USERS[@]} - 1; i >= 0; i--)); do
+    user=${SHELL_USERS[i]}
+    old_shell=${SHELL_OLD_VALUES[i]}
+    if sudo chsh -s "$old_shell" "$user"; then
+      warn "Restored $user login shell to $old_shell"
+    else
+      warn "Could not restore $user login shell; run: sudo chsh -s $old_shell $user"
+    fi
+  done
+
+  for ((i=${#CONFIG_TARGETS[@]} - 1; i >= 0; i--)); do
+    target=${CONFIG_TARGETS[i]}
+    home=${CONFIG_HOMES[i]}
+    backup=${CONFIG_BACKUPS[i]}
+    config="$home/.config/zsh"
+    failed="$home/.config/zsh.failed-$TIMESTAMP-$$"
+
+    if run_as_target "$target" test -e "$config"; then
+      run_as_target "$target" mv "$config" "$failed" &&
+        warn "Saved failed $target configuration at $failed"
+    fi
+    if [[ -n "$backup" ]] && run_as_target "$target" test -e "$backup"; then
+      if run_as_target "$target" mv "$backup" "$config"; then
+        warn "Restored $target configuration from $backup"
+      else
+        warn "Could not restore $target configuration; backup remains at $backup"
+      fi
+    fi
+  done
 }
 
 set_login_shell() {
@@ -373,6 +469,8 @@ set_login_shell() {
   [[ -n "$old_shell" ]] || die "Could not determine the login shell for $user"
   if [[ "$old_shell" != "$zsh_path" ]]; then
     sudo chsh -s "$zsh_path" "$user" || die "Could not change the login shell for $user"
+    SHELL_USERS+=("$user")
+    SHELL_OLD_VALUES+=("$old_shell")
     ROLLBACKS+=("$user: sudo chsh -s $old_shell $user")
     info "Login shell changed for $user: $old_shell -> $zsh_path"
   else
@@ -380,9 +478,22 @@ set_login_shell() {
   fi
 }
 
+remove_legacy_global_zdotdir() {
+  local file=/etc/zsh/zshenv
+  [[ -f "$file" ]] || return 0
+  if grep -q '^# Personal zsh config location$' "$file" &&
+     grep -q '^export ZDOTDIR=\$HOME/.config/zsh$' "$file"; then
+    if sudo sed -i '/^# Personal zsh config location$/{N;/\nexport ZDOTDIR=\$HOME\/.config\/zsh$/d;}' "$file"; then
+      info "Removed the legacy system-wide ZDOTDIR setting"
+    else
+      warn "Could not remove the legacy ZDOTDIR setting from $file"
+    fi
+  fi
+}
+
 verify_tools() {
-  local command_name
-  for command_name in zsh nvim eza bat fd fzf zoxide starship rg lf git curl; do
+  local group command_name apt_package dnf_package alternate
+  while IFS='|' read -r group command_name apt_package dnf_package alternate; do
     system_has "$command_name" || die "Required command is missing after installation: $command_name"
     if [[ "$command_name" == lf ]]; then
       PATH="$SYSTEM_PATH" lf -version &>/dev/null || die "Required command cannot run: lf"
@@ -390,7 +501,7 @@ verify_tools() {
       PATH="$SYSTEM_PATH" "$command_name" --version &>/dev/null ||
         die "Required command cannot run: $command_name"
     fi
-  done
+  done <<< "$TOOL_SPECS"
 }
 
 summary() {
@@ -413,12 +524,17 @@ main() {
   install_packages
   verify_tools
   prepare_template
+  TRANSACTION_OPEN=true
   install_config_for "$(id -un)" "$HOME"
   $INSTALL_ROOT && install_config_for root /root
   set_login_shell "$(id -un)"
   $INSTALL_ROOT && set_login_shell root
   verify_tools
+  TRANSACTION_OPEN=false
+  remove_legacy_global_zdotdir
   summary
 }
 
-main "$@"
+if [[ ${BASH_SOURCE[0]} == "$0" ]]; then
+  main "$@"
+fi
